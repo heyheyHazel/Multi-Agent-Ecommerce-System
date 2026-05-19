@@ -31,108 +31,87 @@
 
 ### 前端对话界面
 
-```
-                    用户在对话框输入
-                    "推荐一款200元以下的面膜"
-                          │
-                          ▼
-┌──────────────────────────────────────────────┐
-│  React 前端（localhost:5173）                  │
-│  fetch POST /api/v1/recommend                │
-│  渲染商品卡片 + 营销文案                       │
-└──────────────────────┬───────────────────────┘
-                       │
-                       ▼
-┌──────────────────────────────────────────────┐
-│  FastAPI 后端（localhost:8000）                │
-│                                               │
-│  SupervisorOrchestrator.recommend()           │
-│  ├─ Phase 1: 用户画像 Agent (并行)             │
-│  ├─ Phase 1: 商品推荐 Agent (并行)             │
-│  ├─ Phase 2: LLM精排 (并行)                   │
-│  ├─ Phase 2: 库存决策 Agent (并行)             │
-│  ├─ Phase 3: 结果聚合                         │
-│  └─ Phase 3: 营销文案 Agent (串行)             │
-└──────────────────────────────────────────────┘
+```mermaid
+graph TB
+    A["用户在对话框输入<br/>推荐一款200元以下的面膜"] --> B["React 前端（localhost:5173）<br/>fetch POST /api/v1/recommend<br/>渲染商品卡片 + 营销文案"]
+    B --> C["FastAPI 后端（localhost:8000）<br/>SupervisorOrchestrator.recommend()"]
+    C --> D["Phase 1: 用户画像 Agent (并行)"]
+    C --> E["Phase 1: 商品推荐 Agent (并行)"]
+    D --> F["Phase 2: LLM精排 (并行)"]
+    E --> G["Phase 2: 库存决策 Agent (并行)"]
+    F --> H["Phase 3: 结果聚合"]
+    G --> H
+    H --> I["Phase 3: 营销文案 Agent (串行)"]
 ```
 
 ### Supervisor 编排架构
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         用户发起推荐请求                           │
-│                    {"user_id": "u001", "num_items": 5}           │
-└───────────────────────────────┬─────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Supervisor 协调Agent                           │
-│                  (python/orchestrator/supervisor.py)              │
-│                                                                   │
-│  ════════════════ Phase 1: 并行执行 ═══════════════════           │
-│  ┌──────────────────────┐    ┌──────────────────────┐            │
-│  │   用户画像 Agent      │    │   商品召回 Agent      │            │
-│  │  user_profile_agent  │    │  product_rec_agent   │            │
-│  │  ──────────────────  │    │  ────────────────── │            │
-│  │  Redis → 实时行为特征 │    │  协同过滤+向量检索召回 │            │
-│  │  RFM模型 → 用户分群   │    │  返回候选商品列表     │            │
-│  └──────────┬───────────┘    └──────────┬──────────┘            │
-│             │                           │                         │
-│  ════════════════ Phase 2: 并行执行 ═══════════════════           │
-│  ┌──────────────────────┐    ┌──────────────────────┐            │
-│  │   LLM重排 Agent      │    │   库存决策 Agent      │            │
-│  │  (product_rec再次调用)│    │   inventory_agent    │            │
-│  │  ──────────────────  │    │  ────────────────── │            │
-│  │  用户画像 × 商品属性  │    │  MySQL → 实时库存查询 │            │
-│  │  LLM精排，返回TopN   │    │  过滤缺货，输出限购策略│            │
-│  └──────────┬───────────┘    └──────────┬──────────┘            │
-│             │                           │                         │
-│  ════════════════ Phase 3: 串行执行 ═══════════════════           │
-│             └──────────────┬────────────┘                         │
-│                            ▼                                      │
-│             ┌──────────────────────────────┐                      │
-│             │      结果聚合器               │                      │
-│             │  库存过滤 → 排序合并 → TopN   │                      │
-│             └──────────────┬───────────────┘                      │
-│                            ▼                                      │
-│             ┌──────────────────────────────┐                      │
-│             │   营销文案 Agent              │                      │
-│             │  marketing_copy_agent        │                      │
-│             │  ────────────────────────── │                      │
-│             │  5套Prompt模板 × 用户分群    │                      │
-│             │  LLM生成 + 广告法合规校验    │                      │
-│             └──────────────┬───────────────┘                      │
-│                            ▼                                      │
-│             ┌──────────────────────────────┐                      │
-│             │   A/B 测试引擎               │                      │
-│             │  用户ID哈希分桶              │                      │
-│             │  Thompson Sampling 动态调优  │                      │
-│             └──────────────┬───────────────┘                      │
-└──────────────────────────────┬──────────────────────────────────┘
-                               ▼
-              ┌─────────────────────────────────┐
-              │  个性化推荐响应（返回给用户）      │
-              │  商品列表 + 个性化文案 + 实验分组 │
-              └─────────────────────────────────┘
+```mermaid
+graph TB
+    USER["用户发起推荐请求<br/>{'user_id': 'u001', 'num_items': 5}"]
+    USER --> SUP["Supervisor 协调Agent<br/>(python/orchestrator/supervisor.py)"]
+
+    subgraph P1["Phase 1: 并行执行"]
+        PROFILE["用户画像 Agent<br/>user_profile_agent<br/>━━━━━━<br/>Redis → 实时行为特征<br/>RFM模型 → 用户分群"]
+        RECALL["商品召回 Agent<br/>product_rec_agent<br/>━━━━━━<br/>协同过滤+向量检索召回<br/>返回候选商品列表"]
+    end
+
+    subgraph P2["Phase 2: 并行执行"]
+        RERANK["LLM重排 Agent<br/>(product_rec再次调用)<br/>━━━━━━<br/>用户画像 × 商品属性<br/>LLM精排，返回TopN"]
+        INVENTORY["库存决策 Agent<br/>inventory_agent<br/>━━━━━━<br/>MySQL → 实时库存查询<br/>过滤缺货，输出限购策略"]
+    end
+
+    subgraph P3["Phase 3: 串行执行"]
+        AGG["结果聚合器<br/>库存过滤 → 排序合并 → TopN"]
+        COPY["营销文案 Agent<br/>marketing_copy_agent<br/>━━━━━━<br/>5套Prompt模板 × 用户分群<br/>LLM生成 + 广告法合规校验"]
+        AB["A/B 测试引擎<br/>用户ID哈希分桶<br/>Thompson Sampling 动态调优"]
+    end
+
+    SUP --> P1
+    P1 --> P2
+    RERANK --> P3
+    INVENTORY --> P3
+    AGG --> COPY --> AB
+
+    P3 --> RESP["个性化推荐响应（返回给用户）<br/>商品列表 + 个性化文案 + 实验分组"]
+
+    style SUP fill:#e3f2fd
+    style RESP fill:#c8e6c9
 ```
 
 ### 为什么用 Supervisor 模式？
 
-```
-Supervisor 模式                     Handoffs 模式
-──────────────────────              ──────────────────────
-   Supervisor（中枢）                 Agent A → Agent B
-    ┌────┬────┬────┐                       ↓
-    ▼    ▼    ▼    ▼                 Agent B → Agent C
-   A    B    C    D                        ↓
-    └────┴────┴────┘                 Agent C → ...
-    结果聚合 → 响应
+```mermaid
+graph LR
+    subgraph SUPMODE["Supervisor 模式（本项目采用）"]
+        SUP["Supervisor（中枢）"]
+        SUP --> A
+        SUP --> B
+        SUP --> C
+        SUP --> D
+        A --> AGG["结果聚合 → 响应"]
+        B --> AGG
+        C --> AGG
+        D --> AGG
+    end
 
-✅ 集中控制，流程清晰          ✅ 去中心化，灵活
-✅ 并行执行，延迟低            ✅ 适合对话/开放式任务
-✅ 异常统一处理                ❌ 状态管理复杂
-本项目采用 Supervisor 模式
+    subgraph HFMODE["Handoffs 模式"]
+        HA["Agent A"]
+        HB["Agent B"]
+        HC["Agent C"]
+        HA --> HB --> HC
+    end
+
+    style SUPMODE fill:#e8f5e9,stroke:#4caf50
+    style HFMODE fill:#fce4ec,stroke:#e91e63
 ```
+
+| | Supervisor 模式 | Handoffs 模式 |
+|--|--|--|
+| 控制方式 | 中枢集中控制 | Agent 间直接传递控制权 |
+| 适合场景 | 流程固定，需要并行 | 对话式，流程动态 |
+| 状态管理 | Supervisor 统一维护 | 每次交接携带上下文 |
+| 本项目 | ✅ 采用 | ❌ 未采用 |
 
 ---
 
@@ -176,20 +155,20 @@ return UserProfile(user_id=user_id, segments=["active"], rfm_score=...)
 
 两阶段推荐：先"召回"大量候选商品，再用 LLM 精排出最合适的 TopN。
 
-```
-多路召回策略
-  ├── 协同过滤（买了A也买了B）
-  ├── 向量检索（Milvus，语义相似商品）
-  ├── 热度策略（最近7天热卖）
-  └── 新品策略（上架30天内）
-        │
-        ▼（去重合并，候选集）
-  LLM 精排
-  │ Prompt: "用户是价格敏感型，偏好手机配件，以下10件商品请排序..."
-  │ 输出: 按相关性从高到低排列的商品 ID 列表
-        │
-        ▼
-  TopN 商品列表（交给库存 Agent 过滤）
+```mermaid
+graph TB
+    CF["协同过滤<br/>买了A也买了B"]
+    VEC["向量检索<br/>Milvus，语义相似商品"]
+    HOT["热度策略<br/>最近7天热卖"]
+    NEW["新品策略<br/>上架30天内"]
+
+    CF --> DEDUP["去重合并，候选集"]
+    VEC --> DEDUP
+    HOT --> DEDUP
+    NEW --> DEDUP
+
+    DEDUP --> LLM["LLM 精排<br/>Prompt: 用户是价格敏感型，偏好手机配件<br/>输出: 按相关性从高到低排列的商品ID列表"]
+    LLM --> TOPN["TopN 商品列表<br/>（交给库存 Agent 过滤）"]
 ```
 
 ---
@@ -571,10 +550,6 @@ curl -s -X POST http://localhost:8000/api/v1/recommend -H "Content-Type: applica
 ```
 
 #### LangGraph 推荐
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/recommend/graph -H "Content-Type: application/json" -d '{"user_id": "user_002", "scene": "detail_page", "num_items": 3}'
-```
 
 ```bash
 curl -s -X POST http://localhost:8000/api/v1/recommend/graph -H "Content-Type: application/json" -d '{"user_id": "user_002", "scene": "detail_page", "num_items": 3}'
