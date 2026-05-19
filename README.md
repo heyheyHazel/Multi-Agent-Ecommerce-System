@@ -67,13 +67,16 @@ graph TB
         AB["A/B 测试引擎<br/>用户ID哈希分桶<br/>Thompson Sampling 动态调优"]
     end
 
-    SUP --> P1
+    SUP --> PROFILE
+    SUP --> RECALL
+    P1 --> P2
     P1 --> P2
     RERANK --> P3
     INVENTORY --> P3
-    AGG --> COPY --> AB
+    AGG --> COPY
+    COPY --> AB
 
-    P3 --> RESP["个性化推荐响应（返回给用户）<br/>商品列表 + 个性化文案 + 实验分组"]
+    AB --> RESP["个性化推荐响应（返回给用户）<br/>商品列表 + 个性化文案 + 实验分组"]
 
     style SUP fill:#e3f2fd
     style RESP fill:#c8e6c9
