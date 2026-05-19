@@ -78,6 +78,7 @@ class UserProfileAgent(BaseAgent):
         """Collect user behavior from feature store or context fallback."""
         if self.feature_store:
             return await self.feature_store.get_user_features(user_id)
+        # fallback: 硬编码示例数据 + context 覆盖
         return {
             "user_id": user_id,
             "recent_views": context.get("recent_views", ["手机", "耳机", "平板"]),

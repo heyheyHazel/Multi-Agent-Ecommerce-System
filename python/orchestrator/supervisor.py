@@ -131,3 +131,79 @@ class SupervisorOrchestrator:
             },
             total_latency_ms=total_latency,
         )
+
+    async def recommend_chat(
+        self, request: RecommendationRequest
+    ) -> RecommendationResponse:
+        """Lightweight recommendation for chat context.
+
+        Skips UserProfileAgent (not needed for search-driven chat),
+        skips MarketingCopyAgent (chat reply is handled by streaming LLM),
+        and passes keyword/category to ProductRecAgent for targeted recall.
+        """
+        request_id = str(uuid.uuid4())
+        start = time.perf_counter()
+
+        keyword = request.context.get("keyword", "")
+        category = request.context.get("category", "")
+        brand = request.context.get("brand", "")
+
+        logger.info(
+            "supervisor.chat_start",
+            request_id=request_id,
+            user_id=request.user_id,
+            keyword=keyword,
+            category=category,
+        )
+
+        # Phase 1: keyword-filtered recall only (no LLM — instant)
+        rec_result = await self.product_rec_agent.run(
+            user_profile=None,
+            num_items=request.num_items * 2,
+            keyword=keyword,
+            category=category,
+            brand=brand,
+            skip_rerank=True,
+        )
+        raw_products: list[Product] = getattr(rec_result, "products", [])
+
+        # Phase 2: rerank with keyword context + inventory check (parallel)
+        rerank_task = self.product_rec_agent.run(
+            user_profile=None,
+            num_items=request.num_items,
+            keyword=keyword,
+            category=category,
+        )
+        inventory_task = self.inventory_agent.run(products=raw_products)
+
+        rerank_result, inventory_result = await asyncio.gather(
+            rerank_task, inventory_task
+        )
+
+        ranked_products: list[Product] = getattr(rerank_result, "products", raw_products)
+        available_ids = set(getattr(inventory_result, "available_products", []))
+        final_products = [p for p in ranked_products if p.product_id in available_ids]
+        if not final_products:
+            final_products = ranked_products[:request.num_items]
+
+        total_latency = (time.perf_counter() - start) * 1000
+
+        logger.info(
+            "supervisor.chat_complete",
+            request_id=request_id,
+            total_latency_ms=round(total_latency, 1),
+            product_count=len(final_products),
+        )
+
+        return RecommendationResponse(
+            request_id=request_id,
+            user_id=request.user_id,
+            products=final_products[:request.num_items],
+            marketing_copies=[],  # chat uses streaming reply instead
+            experiment_group="chat",
+            agent_results={
+                "product_rec": rerank_result,
+                "inventory": inventory_result,
+            },
+            total_latency_ms=total_latency,
+        )

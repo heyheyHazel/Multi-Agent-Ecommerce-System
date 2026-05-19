@@ -8,6 +8,10 @@ from .schemas import (
     ProductRecResult,
     MarketingCopyResult,
     InventoryResult,
+    ChatMessage,
+    ChatRequest,
+    ShoppingIntent,
+    ChatResult,
 )
 
 __all__ = [
@@ -20,4 +24,8 @@ __all__ = [
     "ProductRecResult",
     "MarketingCopyResult",
     "InventoryResult",
+    "ChatMessage",
+    "ChatRequest",
+    "ShoppingIntent",
+    "ChatResult",
 ]

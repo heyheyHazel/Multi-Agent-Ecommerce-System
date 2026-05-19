@@ -4,6 +4,7 @@ Multi-Agent E-Commerce Recommendation System — FastAPI Entry Point
 Endpoints:
   POST /api/v1/recommend          - 获取个性化推荐
   POST /api/v1/recommend/graph    - 通过LangGraph pipeline推荐
+  POST /api/v1/chat               - 聊天式推荐 (SSE streaming)
   GET  /api/v1/experiments        - 查看A/B实验状态
   GET  /api/v1/metrics            - 查看系统监控指标
   GET  /health                    - 健康检查
@@ -11,6 +12,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import json as json_module
 import sys
 import os
 
@@ -23,9 +25,12 @@ import structlog
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from langchain_openai import ChatOpenAI
 
 from config import get_settings
-from models.schemas import RecommendationRequest, RecommendationResponse
+from models.schemas import ChatRequest, RecommendationRequest, RecommendationResponse
+from agents import ChatAgent
 from orchestrator.supervisor import SupervisorOrchestrator
 from orchestrator.graph import build_recommendation_graph
 from services.ab_test import ABTestEngine
@@ -38,6 +43,7 @@ settings = get_settings()
 ab_engine = ABTestEngine()
 metrics_collector = MetricsCollector()
 supervisor = SupervisorOrchestrator(ab_engine=ab_engine)
+chat_agent = ChatAgent(supervisor=supervisor)
 rec_graph = None
 
 
@@ -98,6 +104,80 @@ async def recommend_via_graph(request: RecommendationRequest):
         "experiment_group": result.get("experiment_group", "control"),
         "total_latency_ms": round(result.get("total_latency_ms", 0), 1),
     }
+
+
+@app.post("/api/v1/chat")
+async def chat(request: ChatRequest):
+    """聊天式推荐 — runs ChatAgent for intent + products, then streams reply via SSE.
+
+    SSE event flow: products → token (×N) → done
+    """
+    result = await chat_agent.run(
+        user_id=request.user_id,
+        messages=[m.model_dump() for m in request.messages],
+    )
+
+    intake_products = getattr(result, "products", []) or []
+    reply_prompt = getattr(result, "reply_prompt", "") or ""
+
+    async def _event_stream():
+        # ── Phase 1: emit products immediately ──
+        products_payload = {
+            "products": [
+                {
+                    "product_id": p.product_id,
+                    "name": p.name,
+                    "price": p.price,
+                    "category": p.category,
+                    "brand": p.brand,
+                    "description": p.description,
+                    "image_url": p.image_url,
+                }
+                for p in intake_products[:6]
+            ]
+        }
+        yield _sse_event("products", products_payload)
+
+        # ── Phase 2: stream reply ──
+        if result.success:
+            # Agent succeeded — stream LLM tokens for a natural reply
+            try:
+                stream_llm = ChatOpenAI(
+                    api_key=settings.llm_api_key,
+                    base_url=settings.llm_base_url,
+                    model=settings.llm_model,
+                    temperature=0.7,
+                    max_tokens=1024,
+                    streaming=True,
+                )
+                async for chunk in stream_llm.astream(reply_prompt):
+                    token = chunk.content if hasattr(chunk, "content") else str(chunk)
+                    if token:
+                        yield _sse_event("token", {"content": token})
+            except Exception as exc:
+                logger.error("chat.stream_error", error=str(exc))
+                yield _sse_event("token", {"content": "\n\n抱歉，回复生成过程中出现问题，请重试。"})
+        else:
+            # Agent failed — emit fallback text directly (skip another API call)
+            yield _sse_event("token", {"content": reply_prompt})
+
+        # ── Phase 3: done ──
+        yield _sse_event("done", {})
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _sse_event(event: str, data: dict) -> str:
+    """Format a single SSE event with JSON data payload."""
+    return f"event: {event}\ndata: {json_module.dumps(data, ensure_ascii=False)}\n\n"
 
 
 @app.get("/api/v1/experiments")

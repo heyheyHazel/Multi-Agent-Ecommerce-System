@@ -33,18 +33,86 @@
 
 ```mermaid
 graph TB
-    A["用户在对话框输入<br/>推荐一款200元以下的面膜"] --> B["React 前端（localhost:5173）<br/>fetch POST /api/v1/recommend<br/>渲染商品卡片 + 营销文案"]
-    B --> C["FastAPI 后端（localhost:8000）<br/>SupervisorOrchestrator.recommend()"]
-    C --> D["Phase 1: 用户画像 Agent (并行)"]
-    C --> E["Phase 1: 商品推荐 Agent (并行)"]
-    D --> F["Phase 2: LLM精排 (并行)"]
-    E --> G["Phase 2: 库存决策 Agent (并行)"]
-    F --> H["Phase 3: 结果聚合"]
-    G --> H
-    H --> I["Phase 3: 营销文案 Agent (串行)"]
+    A["用户在对话框输入<br/>推荐一款200元以下的面膜"] --> B["React 前端（localhost:5173）<br/>useChat.js → POST /api/v1/chat<br/>SSE 流式接收 products / token / done 事件"]
+    B --> C["FastAPI 后端（localhost:8000）<br/>POST /api/v1/chat"]
+    C --> D["ChatAgent（意图解析层）<br/>LLM解析聊天意图 → ShoppingIntent"]
+    D --> E{"购物意图?"}
+    E -->|product_search| F["SupervisorOrchestrator.recommend()"]
+    E -->|general_question| G["跳过推荐，直接生成回复"]
+    F --> H["Phase 1: 用户画像 Agent (并行)"]
+    F --> I["Phase 1: 商品推荐 Agent (并行)"]
+    H --> J["Phase 2: LLM精排 (并行)"]
+    I --> K["Phase 2: 库存决策 Agent (并行)"]
+    J --> L["Phase 3: 结果聚合"]
+    K --> L
+    L --> M["Phase 3: 营销文案 Agent (串行)"]
+    M --> N["SSE 流式响应<br/>① products 事件（商品卡片立即渲染）<br/>② token 事件（LLM 逐字流式回复）<br/>③ done 事件（流结束）"]
+    G --> N
 ```
 
-### Supervisor 编排架构
+### 完整架构（含 ChatAgent）
+
+```mermaid
+graph TB
+    CHAT_USER["用户在聊天框输入<br/>推荐一款口红"] --> CHAT_API["POST /api/v1/chat<br/>SSE 流式响应"]
+    CHAT_API --> CHAT_AGENT["ChatAgent（意图解析层）<br/>━━━━━━<br/>LLM 解析聊天历史 → ShoppingIntent<br/>product_search / general_question"]
+
+    CHAT_AGENT -->|product_search| SUP["Supervisor 协调Agent<br/>(python/orchestrator/supervisor.py)"]
+    CHAT_AGENT -->|general_question| CHAT_REPLY["直接生成文本回复<br/>跳过商品推荐"]
+
+    RECO_USER["直接 API 调用<br/>POST /api/v1/recommend"] --> SUP
+
+    SUP --> CHAT_REPLY
+
+    subgraph P1["Phase 1: 并行执行"]
+        PROFILE["用户画像 Agent<br/>user_profile_agent<br/>━━━━━━<br/>Redis → 实时行为特征<br/>RFM模型 → 用户分群"]
+        RECALL["商品召回 Agent<br/>product_rec_agent<br/>━━━━━━<br/>MOCK_PRODUCTS 商品库<br/>返回候选商品列表"]
+    end
+
+    subgraph P2["Phase 2: 并行执行"]
+        RERANK["LLM重排 Agent<br/>product_rec_agent<br/>━━━━━━<br/>用户画像 × 商品属性<br/>LLM精排，返回TopN"]
+        INVENTORY["库存决策 Agent<br/>inventory_agent<br/>━━━━━━<br/>MOCK_PRODUCTS stock 字段<br/>过滤缺货，输出限购策略"]
+    end
+
+    subgraph P3["Phase 3: 串行执行"]
+        AGG["结果聚合器<br/>库存过滤 → 排序合并 → TopN"]
+        COPY["营销文案 Agent<br/>marketing_copy_agent<br/>━━━━━━<br/>5套Prompt模板 × 用户分群<br/>LLM生成 + 广告法合规校验"]
+        AB["A/B 测试引擎<br/>用户ID哈希分桶<br/>Thompson Sampling 动态调优"]
+    end
+
+    CHAT_REPLY --> RESP["SSE 流式响应（返回给前端）<br/>① products 事件 → 商品卡片渲染<br/>② token 事件 → LLM 逐字流式回复<br/>③ done 事件 → 流结束"]
+
+    SUP --> PROFILE
+    SUP --> RECALL
+    P1 --> P2
+    P1 --> P2
+    RERANK --> P3
+    INVENTORY --> P3
+    AGG --> COPY
+    COPY --> AB
+
+    AB --> RESP
+
+    style CHAT_AGENT fill:#fff3e0
+    style SUP fill:#e3f2fd
+    style RESP fill:#c8e6c9
+```
+
+### 为什么 ChatAgent 在 Supervisor 前面？
+
+```
+用户聊天消息 → ChatAgent（意图解析）→ Supervisor（商品推荐）→ SSE 流式回复
+                  ↑ 前置门面层                   ↑ 多Agent编排层
+```
+
+ChatAgent 作为**前置门面层**，负责：
+1. **意图识别**：判断用户是在购物咨询还是闲聊
+2. **参数提取**：从自然语言中提取类目、品牌、价格区间
+3. **分流控制**：`product_search` 走 Supervisor 推荐流程，`general_question` 直接回复
+
+Supervisor 作为**多 Agent 编排层**，保持原有职责不变——并行调度 4 个专业 Agent 完成推荐。
+
+### Supervisor 编排架构（直接 API 路径）
 
 ```mermaid
 graph TB
@@ -57,8 +125,8 @@ graph TB
     end
 
     subgraph P2["Phase 2: 并行执行"]
-        RERANK["LLM重排 Agent<br/>(product_rec再次调用)<br/>━━━━━━<br/>用户画像 × 商品属性<br/>LLM精排，返回TopN"]
-        INVENTORY["库存决策 Agent<br/>inventory_agent<br/>━━━━━━<br/>MySQL → 实时库存查询<br/>过滤缺货，输出限购策略"]
+        RERANK["LLM重排 Agent<br/>product_rec_agent<br/>━━━━━━<br/>用户画像 × 商品属性<br/>LLM精排，返回TopN"]
+        INVENTORY["库存决策 Agent<br/>inventory_agent<br/>━━━━━━<br/>MOCK_PRODUCTS stock 字段<br/>过滤缺货，输出限购策略"]
     end
 
     subgraph P3["Phase 3: 串行执行"]
@@ -118,7 +186,40 @@ graph LR
 
 ---
 
-## 四大核心 Agent 详解
+## 五大核心 Agent 详解
+
+### Agent 0：聊天意图 Agent（ChatAgent）
+
+**文件**：[`python/agents/chat_agent.py`](python/agents/chat_agent.py)
+
+**它做什么？**
+
+作为前置门面层，解析用户的聊天消息，提取购物意图，然后委托给 SupervisorOrchestrator 完成商品推荐。
+
+**核心逻辑**：
+
+```python
+# Step 1：LLM 解析聊天历史，提取结构化购物意图
+intent = await self._parse_intent(messages)
+# → ShoppingIntent(category="口红", brand="YSL", price_max=500, intent_type="product_search")
+
+# Step 2：分流 —— 购物意图走推荐，闲聊直接回复
+if intent.intent_type == "general_question":
+    return ChatResult(reply_prompt="用户发来了一条非购物消息...")
+else:
+    products = await self._supervisor.recommend(request)  # 委托给Supervisor
+    return ChatResult(products=products, reply_prompt=...)
+```
+
+**在架构中的位置**：
+
+```
+ChatAgent（前置门面层）→ SupervisorOrchestrator（多Agent编排层）→ 4个专业Agent
+```
+
+ChatAgent 和 Supervisor 各司其职 —— ChatAgent 负责"理解用户想干什么"，Supervisor 负责"调用专业 Agent 完成任务"。
+
+---
 
 ### Agent 1：用户画像 Agent
 
@@ -558,6 +659,14 @@ curl -s -X POST http://localhost:8000/api/v1/recommend -H "Content-Type: applica
 curl -s -X POST http://localhost:8000/api/v1/recommend/graph -H "Content-Type: application/json" -d '{"user_id": "user_002", "scene": "detail_page", "num_items": 3}'
 ```
 
+#### 聊天式推荐（SSE 流式）
+
+```bash
+curl -N -X POST http://localhost:8000/api/v1/chat -H "Content-Type: application/json" -d '{"user_id":"U001","messages":[{"role":"user","content":"推荐一款口红"}]}'
+```
+
+> 使用 `-N` 禁用 curl 缓冲，才能看到 SSE 事件逐条输出。
+
 #### Swagger 交互式文档
 
 浏览器打开 http://localhost:8000/docs ，可以直接在页面上填参数测试所有接口。
@@ -613,12 +722,14 @@ Product(
 | 耳机 | 2 | AirPods Pro 3, Sony WH-1000XM6 |
 | 平板 | 2 | iPad Air M3, 小米平板7 Pro |
 | 配件 | 3 | Anker充电器, 绿联充电头, 罗技鼠标 |
-| 美妆 | 5 | YSL口红, 兰蔻精华, MAC腮红, SK-II, 完美日记 |
-| 女装 | 2 | ZARA连衣裙, 优衣库防晒衣 |
-| 鞋靴 | 2 | SW高跟鞋, 百丽平底鞋 |
-| 箱包 | 1 | Coach托特包 |
-| 个护 | 3 | 戴森卷发棒, 薇诺娜面膜, 欧莱雅面膜 |
-| 其他 | 6 | 笔记本, 显示器, SSD, Apple Watch, 无人机, Switch |
+| 笔记本 | 1 | 机械革命极光X |
+| 显示器 | 1 | 戴尔U2724D |
+| 存储 | 1 | 三星980 Pro 2TB |
+| 穿戴 | 1 | Apple Watch Ultra 3 |
+| 无人机 | 1 | 大疆Mini 4 Pro |
+| 游戏机 | 1 | Switch 2 |
+
+> **注意**：当前商品库全部为数码/电子产品（共 15 个）。如需让 ChatAgent 推荐美妆、服饰等类目，需先在 `MOCK_PRODUCTS` 中添加对应商品。
 
 #### 添加新商品
 
@@ -629,6 +740,69 @@ Product(product_id="P029", name="新商品名", category="新类目", price=99, 
 ```
 
 修改后重启服务生效。
+
+---
+
+### 数据存储现状（Redis · MySQL · 商品库）
+
+**重要：项目目前处于 Phase 1 阶段，所有持久化存储均未实际连接。系统使用内存/硬编码数据运行，核心功能不受影响。**
+
+#### 数据存储位置一览
+
+| 数据 | 当前存储位置 | 文件 | Phase 2 计划 |
+|------|-----------|------|-------------|
+| 商品库 | `MOCK_PRODUCTS` 列表（15 个商品） | `agents/product_rec_agent.py:41-57` | MySQL 商品表 |
+| 库存数据 | `Product.stock` 字段（硬编码在商品对象上） | `agents/product_rec_agent.py`（同上） | MySQL 库存表，通过 InventoryAgent MCP 查询 |
+| 用户行为 | 无（用 context dict 传入的硬编码示例数据） | `agents/user_profile_agent.py:80-89` | Redis Sorted Set，key 格式 `behavior:{user_id}:{type}` |
+| 用户画像标签 | 无（LLM 实时生成，用完即丢） | `agents/user_profile_agent.py` | Redis String，key 格式 `profile:{user_id}` |
+| A/B 实验数据 | 内存 dict（重启丢失） | `services/ab_test.py` | 待定 |
+| 监控指标 | 内存 defaultdict（重启丢失） | `services/metrics.py` | Prometheus |
+
+#### 如何修改商品数据（含库存）
+
+直接编辑 `python/agents/product_rec_agent.py` 中的 `MOCK_PRODUCTS` 列表即可。每个商品的 `stock` 字段就是库存数量：
+
+```python
+Product(
+    product_id="P016",         # 唯一标识
+    name="YSL小金条口红",       # 商品名
+    category="美妆",           # 类目
+    price=320,                 # 价格
+    brand="YSL",               # 品牌
+    seller_id="S13",           # 卖家ID
+    stock=800,                 # 库存（设为 0 会被库存 Agent 过滤掉）
+    tags=["口红", "热卖"],      # 标签
+),
+```
+
+**修改库存值：** 改 `stock` 字段 → 设为 0 商品即会被 InventoryAgent 标记为缺货并过滤。
+
+**添加类目：** 目前只有数码类商品（手机/耳机/平板等），没有美妆/服装等类目。如果要让 ChatAgent 能推荐口红，需要先在 `MOCK_PRODUCTS` 中添加美妆类商品。
+
+#### Redis Feature Store（未启用）
+
+`services/feature_store.py` 中定义了完整的 Redis 操作层，但当前没有在任何地方实例化。三处硬编码了 `# injected in Phase 2`：
+
+- `UserProfileAgent.feature_store = None` → 用户画像 Agent 无法读取真实行为数据
+- `ProductRecAgent.vector_store = None` → 向量检索未开启
+- `InventoryAgent.db = None` → 库存查询未连接数据库
+
+当启用 Redis 后，用户行为数据格式为：
+
+```text
+Key:    behavior:{用户ID}:{行为类型}
+Value:  JSON 字符串（商品信息）
+Score:  时间戳（用于按时间范围查询）
+```
+
+例如记录用户 U001 浏览了口红：
+```bash
+redis-cli ZADD behavior:U001:view $(date +%s) '{"item_id":"口红","ts":'$(date +%s)'}'
+```
+
+#### MySQL 数据库（未启用）
+
+`config/settings.py` 中声明了 `database_url: str = "sqlite:///./ecommerce.db"`，`requirements.txt` 包含 `sqlalchemy>=2.0.0`，但项目中**没有任何 ORM 模型、表定义或数据库查询**。SQLAlchemy 仅作为依赖声明，运行时不需要数据库即可工作。
 
 ---
 
@@ -673,6 +847,7 @@ docker-compose down
 | GET | `/health` | 健康检查 |
 | POST | `/api/v1/recommend` | 核心推荐（Supervisor 编排） |
 | POST | `/api/v1/recommend/graph` | LangGraph 状态图推荐 |
+| POST | `/api/v1/chat` | 聊天式推荐（ChatAgent + SSE 流式） |
 | GET | `/api/v1/experiments` | A/B 实验状态 |
 | GET | `/api/v1/metrics` | 系统监控指标 |
 | POST | `/api/v1/experiments/{id}/outcome` | 记录 A/B 测试结果 |
@@ -718,8 +893,9 @@ Content-Type: application/json
 multi-agent-ecommerce-system/
 ├── python/                      # 后端（FastAPI）
 │   ├── main.py                  # 入口，定义所有路由
-│   ├── agents/                  # 四个 Agent
+│   ├── agents/                  # 五个 Agent
 │   │   ├── base_agent.py        # 基类（重试、超时、降级）
+│   │   ├── chat_agent.py            # 聊天意图解析（前置门面）
 │   │   ├── user_profile_agent.py    # 用户画像
 │   │   ├── product_rec_agent.py     # 商品推荐（含商品库）
 │   │   ├── marketing_copy_agent.py  # 营销文案
@@ -782,7 +958,7 @@ multi-agent-ecommerce-system/
 
 > 单 Agent 管理几十个工具时，上下文膨胀、推理准确率会明显下降。Multi-Agent 的核心优势有三点：
 > 1. **上下文隔离**：每个 Agent 只关注自己领域的工具和数据，Token 消耗少、推理准确
-> 2. **并行加速**：4 个 Agent 可以同时跑，端到端延迟约等于最慢 Agent 的耗时
+> 2. **并行加速**：多个 Agent 可以同时跑，端到端延迟约等于最慢 Agent 的耗时
 > 3. **独立演进**：各 Agent 可以独立升级、独立做 A/B 测试，互不影响
 
 ---
@@ -914,8 +1090,8 @@ multi-agent-ecommerce-system/
 ```
 多Agent电商推荐与营销系统 | 个人项目 | 2026.01 - 2026.04
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-* 设计并实现基于 Supervisor 模式的多 Agent 协同架构，含用户画像、商品推荐、
-  营销文案、库存决策 4 个专业 Agent，采用并行分发+聚合的编排模式
+* 设计并实现基于 Supervisor 模式的多 Agent 协同架构，含聊天意图解析（ChatAgent）、
+  用户画像、商品推荐、营销文案、库存决策 5 个 Agent，采用并行分发+聚合的编排模式
 
 * 基于 Redis Sorted Set 实现实时用户特征工程（RFM 模型+行为序列），
   特征更新延迟 < 100ms，支持 1h/24h/7d 多时间窗口滑动计算

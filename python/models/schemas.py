@@ -92,3 +92,39 @@ class RecommendationResponse(BaseModel):
     agent_results: dict[str, AgentResult] = Field(default_factory=dict)
     total_latency_ms: float = 0.0
     timestamp: datetime = Field(default_factory=datetime.now)
+
+
+# ── Chat / SSE streaming models ──────────────────────────────────────────
+
+
+class ChatMessage(BaseModel):
+    """Single chat message matching frontend contract ({role, content})."""
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    """Inbound POST body for /api/v1/chat SSE streaming."""
+    user_id: str
+    messages: list[ChatMessage] = Field(default_factory=list)
+
+
+class ShoppingIntent(BaseModel):
+    """Parsed shopping intent extracted from chat messages by the LLM."""
+    category: str = ""
+    brand: str = ""
+    price_min: float = 0.0
+    price_max: float = 10000.0
+    keyword: str = ""
+    intent_type: str = "general_question"  # product_search | general_question
+    num_items: int = 6
+
+
+class ChatResult(AgentResult):
+    """Typed result from ChatAgent carrying intent, products, copies, and a
+    prompt ready for the downstream streaming-reply LLM."""
+    agent_name: str = "chat"
+    intent: ShoppingIntent | None = None
+    products: list[Product] = Field(default_factory=list)
+    marketing_copies: list[dict[str, str]] = Field(default_factory=list)
+    reply_prompt: str = ""

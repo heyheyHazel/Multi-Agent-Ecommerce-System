@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     agent_timeout_product_rec: float = 8.0
     agent_timeout_marketing_copy: float = 10.0
     agent_timeout_inventory: float = 5.0
+    agent_timeout_chat: float = 15.0
 
     model_config = {"env_file": ".env", "env_prefix": "ECOM_"}
 
